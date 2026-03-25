@@ -204,39 +204,76 @@ namespace ScannerInterface3
                         {
                             Log($"WIA: Scanning page {pageCount + 1}...");
 
-                            // Transfer image using parameterless Transfer() - WIA 2.0 style
+                            // Try multiple transfer methods
                             dynamic imageFile = null;
+                            Exception lastError = null;
                             
+                            // Method 1: Try Transfer() with format GUID string
                             try
                             {
-                                imageFile = (dynamic)scanItem.Transfer();
+                                Log("WIA: Trying Transfer with BMP format GUID...");
+                                imageFile = scanItem.Transfer(WIA_FORMAT_BMP);
                             }
-                            catch (COMException transferEx)
+                            catch (Exception ex1)
                             {
-                                Log($"WIA: Transfer() failed with error 0x{(uint)transferEx.ErrorCode:X8}: {transferEx.Message}");
-                                throw;
-                            }
-
-                            if (imageFile != null)
-                            {
-                                // Get the image data from WIA ImageFile
-                                dynamic vector = imageFile.FileData;
-                                byte[] imageData = (byte[])vector.BinaryData;
+                                lastError = ex1;
+                                Log($"WIA: Transfer(format) failed: {ex1.Message}");
                                 
-                                Log($"WIA: Received {imageData.Length} bytes of image data.");
-
-                                using (var ms = new MemoryStream(imageData))
+                                // Method 2: Try parameterless Transfer()
+                                try
                                 {
-                                    var bitmap = new Bitmap(ms);
-                                    pages.Add(new Bitmap(bitmap)); // Clone the bitmap
+                                    Log("WIA: Trying parameterless Transfer...");
+                                    imageFile = scanItem.Transfer();
                                 }
-                                pageCount++;
-                                Log($"WIA: Page {pageCount} scanned successfully.");
-
-                                // Release COM objects
-                                Marshal.ReleaseComObject(vector);
-                                Marshal.ReleaseComObject(imageFile);
+                                catch (Exception ex2)
+                                {
+                                    lastError = ex2;
+                                    Log($"WIA: Transfer() failed: {ex2.Message}");
+                                    
+                                    // Method 3: Use CommonDialog for transfer
+                                    try
+                                    {
+                                        Log("WIA: Trying CommonDialog.ShowTransfer...");
+                                        Type commonDialogType = Type.GetTypeFromProgID("WIA.CommonDialog");
+                                        dynamic commonDialog = Activator.CreateInstance(commonDialogType);
+                                        imageFile = commonDialog.ShowTransfer(scanItem, WIA_FORMAT_BMP, false);
+                                        Marshal.ReleaseComObject(commonDialog);
+                                    }
+                                    catch (Exception ex3)
+                                    {
+                                        lastError = ex3;
+                                        Log($"WIA: ShowTransfer failed: {ex3.Message}");
+                                    }
+                                }
                             }
+                            
+                            if (imageFile == null)
+                            {
+                                string errMsg = lastError?.Message ?? "Unknown error";
+                                if (lastError is COMException comEx)
+                                {
+                                    errMsg = $"0x{(uint)comEx.ErrorCode:X8}: {comEx.Message}";
+                                }
+                                throw new Exception($"All transfer methods failed. Last error: {errMsg}");
+                            }
+
+                            // Get the image data from WIA ImageFile
+                            dynamic vector = imageFile.FileData;
+                            byte[] imageData = (byte[])vector.BinaryData;
+                            
+                            Log($"WIA: Received {imageData.Length} bytes of image data.");
+
+                            using (var ms = new MemoryStream(imageData))
+                            {
+                                var bitmap = new Bitmap(ms);
+                                pages.Add(new Bitmap(bitmap)); // Clone the bitmap
+                            }
+                            pageCount++;
+                            Log($"WIA: Page {pageCount} scanned successfully.");
+
+                            // Release COM objects
+                            Marshal.ReleaseComObject(vector);
+                            Marshal.ReleaseComObject(imageFile);
 
                             // Check if there are more pages in feeder
                             if (useFeeder)
