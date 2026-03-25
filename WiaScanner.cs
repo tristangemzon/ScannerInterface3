@@ -106,8 +106,6 @@ namespace ScannerInterface3
                     return "WIA: Failed to connect to scanner.";
                 }
 
-                var pages = new List<Bitmap>();
-
                 try
                 {
                     // Configure device for feeder/duplex if requested
@@ -141,107 +139,99 @@ namespace ScannerInterface3
                     }
                     catch { }
 
-                    // Set scan properties - each wrapped individually as some scanners don't support all
-                    int dpi = GetDpi(resolution);
-                    int wiaColorMode = GetWiaColorMode(colorMode);
-
+                    // First, try scanning with device defaults (no property changes)
+                    // Some scanners fail if properties are set incorrectly
+                    Log("WIA: Attempting scan with device defaults first...");
+                    
+                    bool useDefaults = true;
+                    dynamic imageFile = null;
+                    
+                    // Try with defaults first
                     try
                     {
-                        SetItemProperty(scanItem, WIA_ITEM_PROPERTY_HORIZONTAL_RESOLUTION, dpi);
-                        Log($"WIA: Set horizontal resolution to {dpi}");
+                        imageFile = scanItem.Transfer();
+                        Log("WIA: Transfer with defaults succeeded!");
+                        useDefaults = true;
                     }
-                    catch (Exception ex) { Log($"WIA: Could not set horizontal resolution: {ex.Message}"); }
-
-                    try
+                    catch (Exception defEx)
                     {
-                        SetItemProperty(scanItem, WIA_ITEM_PROPERTY_VERTICAL_RESOLUTION, dpi);
-                        Log($"WIA: Set vertical resolution to {dpi}");
+                        Log($"WIA: Transfer with defaults failed: {defEx.Message}");
+                        Log("WIA: Will try setting properties...");
+                        useDefaults = false;
+                        imageFile = null;
                     }
-                    catch (Exception ex) { Log($"WIA: Could not set vertical resolution: {ex.Message}"); }
-
-                    try
+                    
+                    // If defaults didn't work, try setting properties
+                    if (imageFile == null)
                     {
-                        SetItemProperty(scanItem, WIA_ITEM_PROPERTY_COLOR_MODE, wiaColorMode);
-                        Log($"WIA: Set color mode to {wiaColorMode}");
-                    }
-                    catch (Exception ex) { Log($"WIA: Could not set color mode: {ex.Message}"); }
+                        int dpi = GetDpi(resolution);
+                        int wiaColorMode = GetWiaColorMode(colorMode);
 
-                    // Try to set extent (optional - some scanners don't support custom extents)
-                    try
-                    {
-                        if (pageWidth > 0 && pageHeight > 0)
+                        try
                         {
-                            // Calculate extent based on resolution and page size (page size in 1/1000 inch)
-                            int horizontalExtent = (int)((pageWidth / 1000.0) * dpi);
-                            int verticalExtent = (int)((pageHeight / 1000.0) * dpi);
-                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_HORIZONTAL_EXTENT, horizontalExtent);
-                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_VERTICAL_EXTENT, verticalExtent);
+                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_HORIZONTAL_RESOLUTION, dpi);
+                            Log($"WIA: Set horizontal resolution to {dpi}");
                         }
-                    }
-                    catch (Exception ex)
-                    {
-                        Log($"WIA: Could not set scan extent (using default): {ex.Message}");
-                    }
+                        catch (Exception ex) { Log($"WIA: Could not set horizontal resolution: {ex.Message}"); }
 
-                    // Scan pages
-                    bool hasMorePages = true;
-                    int pageCount = 0;
-                    const int maxPages = 100; // Safety limit
+                        try
+                        {
+                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_VERTICAL_RESOLUTION, dpi);
+                            Log($"WIA: Set vertical resolution to {dpi}");
+                        }
+                        catch (Exception ex) { Log($"WIA: Could not set vertical resolution: {ex.Message}"); }
 
-                    // Try to set output format to BMP (most compatible)
-                    try
-                    {
-                        SetItemProperty(scanItem, WIA_ITEM_PROPERTY_FORMAT, WIA_FORMAT_BMP);
-                    }
-                    catch
-                    {
-                        Log("WIA: Could not set format property, using device default.");
-                    }
+                        try
+                        {
+                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_COLOR_MODE, wiaColorMode);
+                            Log($"WIA: Set color mode to {wiaColorMode}");
+                        }
+                        catch (Exception ex) { Log($"WIA: Could not set color mode: {ex.Message}"); }
 
-                    while (hasMorePages && pageCount < maxPages)
-                    {
-                        Log($"WIA: Scanning page {pageCount + 1}...");
+                        // Try to set extent (optional - some scanners don't support custom extents)
+                        try
+                        {
+                            if (pageWidth > 0 && pageHeight > 0)
+                            {
+                                // Calculate extent based on resolution and page size (page size in 1/1000 inch)
+                                int horizontalExtent = (int)((pageWidth / 1000.0) * dpi);
+                                int verticalExtent = (int)((pageHeight / 1000.0) * dpi);
+                                SetItemProperty(scanItem, WIA_ITEM_PROPERTY_HORIZONTAL_EXTENT, horizontalExtent);
+                                SetItemProperty(scanItem, WIA_ITEM_PROPERTY_VERTICAL_EXTENT, verticalExtent);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"WIA: Could not set scan extent (using default): {ex.Message}");
+                        }
 
-                        dynamic imageFile = null;
-                        string transferError = null;
+                        // Try to set output format to BMP (most compatible)
+                        try
+                        {
+                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_FORMAT, WIA_FORMAT_BMP);
+                        }
+                        catch
+                        {
+                            Log("WIA: Could not set format property, using device default.");
+                        }
                         
-                        // Method 1: Simple parameterless Transfer (most compatible)
-                        Log("WIA: Attempting Transfer()...");
+                        // Now try transfer again
                         try
                         {
                             imageFile = scanItem.Transfer();
-                            Log("WIA: Transfer() succeeded.");
+                            Log("WIA: Transfer with properties succeeded!");
                         }
-                        catch (Exception ex1)
+                        catch (Exception propEx)
                         {
-                            transferError = ex1.Message;
-                            Log($"WIA: Transfer() exception: {ex1.GetType().Name}: {ex1.Message}");
+                            Log($"WIA: Transfer with properties also failed: {propEx.Message}");
                         }
-                        
-                        // Method 2: If parameterless failed, try with format
-                        if (imageFile == null)
-                        {
-                            Log("WIA: Attempting Transfer(formatId)...");
-                            try
-                            {
-                                imageFile = scanItem.Transfer(WIA_FORMAT_BMP);
-                                Log("WIA: Transfer(formatId) succeeded.");
-                            }
-                            catch (Exception ex2)
-                            {
-                                transferError = ex2.Message;
-                                Log($"WIA: Transfer(formatId) exception: {ex2.GetType().Name}: {ex2.Message}");
-                            }
-                        }
-
-                        if (imageFile == null)
-                        {
-                            throw new Exception($"WIA Transfer failed: {transferError}");
-                        }
-
+                    }
+                    
+                    // Process the image if we got one from the first attempt
+                    if (imageFile != null)
+                    {
                         try
                         {
-                            // Get the image data from WIA ImageFile
                             Log("WIA: Getting FileData from imageFile...");
                             dynamic vector = imageFile.FileData;
                             
@@ -249,89 +239,46 @@ namespace ScannerInterface3
                             byte[] imageData = (byte[])vector.BinaryData;
                             
                             Log($"WIA: Received {imageData.Length} bytes of image data.");
-
+                            
+                            var pages = new List<Bitmap>();
                             using (var ms = new MemoryStream(imageData))
                             {
                                 var bitmap = new Bitmap(ms);
-                                pages.Add(new Bitmap(bitmap)); // Clone the bitmap
+                                pages.Add(new Bitmap(bitmap));
                             }
-                            pageCount++;
-                            Log($"WIA: Page {pageCount} scanned successfully.");
 
-                            // Release COM objects
                             Marshal.ReleaseComObject(vector);
                             Marshal.ReleaseComObject(imageFile);
+                            
+                            // Create PDF
+                            Log($"WIA: Creating PDF with {pages.Count} page(s)...");
+                            CreatePdfFromBitmaps(pages, outputPdfPath);
+                            
+                            foreach (var page in pages)
+                            {
+                                page.Dispose();
+                            }
+                            
+                            Log("WIA: Scan completed successfully.");
+                            return "";
                         }
                         catch (Exception dataEx)
                         {
                             Log($"WIA: Error extracting image data: {dataEx.Message}");
                             throw;
                         }
-
-                        // Check if there are more pages in feeder
-                        if (useFeeder)
-                        {
-                            hasMorePages = HasMorePagesInFeeder(device);
-                            if (hasMorePages)
-                            {
-                                // For ADF, we need to get a fresh scan item for each page
-                                try
-                                {
-                                    items = device.Items;
-                                    if (items.Count > 0)
-                                    {
-                                        scanItem = items[1];
-                                        // Re-apply format setting for next page
-                                        try
-                                        {
-                                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_FORMAT, WIA_FORMAT_BMP);
-                                        }
-                                        catch { }
-                                    }
-                                    else
-                                    {
-                                        hasMorePages = false;
-                                    }
-                                }
-                                catch
-                                {
-                                    hasMorePages = false;
-                                }
-                            }
-                        }
-                        else
-                        {
-                            hasMorePages = false; // Flatbed only scans one page
-                        }
                     }
+                    
+                    // If we get here, all transfer attempts failed
+                    return "WIA: All transfer methods failed. Scanner may not be WIA-compatible.";
                 }
                 finally
                 {
-                    // Release device COM object
                     if (device != null)
                     {
                         Marshal.ReleaseComObject(device);
                     }
                 }
-
-                if (pages.Count == 0)
-                {
-                    return "WIA: No pages were scanned.";
-                }
-
-                // Create PDF from scanned pages
-                Log($"WIA: Creating PDF with {pages.Count} page(s)...");
-                CreatePdfFromBitmaps(pages, outputPdfPath);
-
-                // Cleanup
-                foreach (var page in pages)
-                {
-                    page.Dispose();
-                }
-                pages.Clear();
-
-                Log("WIA: Scan completed successfully.");
-                return ""; // Empty string indicates success
             }
             catch (COMException comEx)
             {
