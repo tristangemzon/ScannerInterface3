@@ -200,65 +200,52 @@ namespace ScannerInterface3
 
                     while (hasMorePages && pageCount < maxPages)
                     {
+                        Log($"WIA: Scanning page {pageCount + 1}...");
+
+                        dynamic imageFile = null;
+                        string transferError = null;
+                        
+                        // Method 1: Simple parameterless Transfer (most compatible)
+                        Log("WIA: Attempting Transfer()...");
                         try
                         {
-                            Log($"WIA: Scanning page {pageCount + 1}...");
-
-                            // Try multiple transfer methods
-                            dynamic imageFile = null;
-                            Exception lastError = null;
-                            
-                            // Method 1: Try Transfer() with format GUID string
+                            imageFile = scanItem.Transfer();
+                            Log("WIA: Transfer() succeeded.");
+                        }
+                        catch (Exception ex1)
+                        {
+                            transferError = ex1.Message;
+                            Log($"WIA: Transfer() exception: {ex1.GetType().Name}: {ex1.Message}");
+                        }
+                        
+                        // Method 2: If parameterless failed, try with format
+                        if (imageFile == null)
+                        {
+                            Log("WIA: Attempting Transfer(formatId)...");
                             try
                             {
-                                Log("WIA: Trying Transfer with BMP format GUID...");
                                 imageFile = scanItem.Transfer(WIA_FORMAT_BMP);
+                                Log("WIA: Transfer(formatId) succeeded.");
                             }
-                            catch (Exception ex1)
+                            catch (Exception ex2)
                             {
-                                lastError = ex1;
-                                Log($"WIA: Transfer(format) failed: {ex1.Message}");
-                                
-                                // Method 2: Try parameterless Transfer()
-                                try
-                                {
-                                    Log("WIA: Trying parameterless Transfer...");
-                                    imageFile = scanItem.Transfer();
-                                }
-                                catch (Exception ex2)
-                                {
-                                    lastError = ex2;
-                                    Log($"WIA: Transfer() failed: {ex2.Message}");
-                                    
-                                    // Method 3: Use CommonDialog for transfer
-                                    try
-                                    {
-                                        Log("WIA: Trying CommonDialog.ShowTransfer...");
-                                        Type commonDialogType = Type.GetTypeFromProgID("WIA.CommonDialog");
-                                        dynamic commonDialog = Activator.CreateInstance(commonDialogType);
-                                        imageFile = commonDialog.ShowTransfer(scanItem, WIA_FORMAT_BMP, false);
-                                        Marshal.ReleaseComObject(commonDialog);
-                                    }
-                                    catch (Exception ex3)
-                                    {
-                                        lastError = ex3;
-                                        Log($"WIA: ShowTransfer failed: {ex3.Message}");
-                                    }
-                                }
+                                transferError = ex2.Message;
+                                Log($"WIA: Transfer(formatId) exception: {ex2.GetType().Name}: {ex2.Message}");
                             }
-                            
-                            if (imageFile == null)
-                            {
-                                string errMsg = lastError?.Message ?? "Unknown error";
-                                if (lastError is COMException comEx)
-                                {
-                                    errMsg = $"0x{(uint)comEx.ErrorCode:X8}: {comEx.Message}";
-                                }
-                                throw new Exception($"All transfer methods failed. Last error: {errMsg}");
-                            }
+                        }
 
+                        if (imageFile == null)
+                        {
+                            throw new Exception($"WIA Transfer failed: {transferError}");
+                        }
+
+                        try
+                        {
                             // Get the image data from WIA ImageFile
+                            Log("WIA: Getting FileData from imageFile...");
                             dynamic vector = imageFile.FileData;
+                            
+                            Log("WIA: Getting BinaryData from vector...");
                             byte[] imageData = (byte[])vector.BinaryData;
                             
                             Log($"WIA: Received {imageData.Length} bytes of image data.");
@@ -274,75 +261,47 @@ namespace ScannerInterface3
                             // Release COM objects
                             Marshal.ReleaseComObject(vector);
                             Marshal.ReleaseComObject(imageFile);
+                        }
+                        catch (Exception dataEx)
+                        {
+                            Log($"WIA: Error extracting image data: {dataEx.Message}");
+                            throw;
+                        }
 
-                            // Check if there are more pages in feeder
-                            if (useFeeder)
+                        // Check if there are more pages in feeder
+                        if (useFeeder)
+                        {
+                            hasMorePages = HasMorePagesInFeeder(device);
+                            if (hasMorePages)
                             {
-                                hasMorePages = HasMorePagesInFeeder(device);
-                                if (hasMorePages)
+                                // For ADF, we need to get a fresh scan item for each page
+                                try
                                 {
-                                    // For ADF, we need to get a fresh scan item for each page
-                                    try
+                                    items = device.Items;
+                                    if (items.Count > 0)
                                     {
-                                        items = device.Items;
-                                        if (items.Count > 0)
+                                        scanItem = items[1];
+                                        // Re-apply format setting for next page
+                                        try
                                         {
-                                            scanItem = items[1];
-                                            // Re-apply format setting for next page
-                                            try
-                                            {
-                                                SetItemProperty(scanItem, WIA_ITEM_PROPERTY_FORMAT, WIA_FORMAT_BMP);
-                                            }
-                                            catch { }
+                                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_FORMAT, WIA_FORMAT_BMP);
                                         }
-                                        else
-                                        {
-                                            hasMorePages = false;
-                                        }
+                                        catch { }
                                     }
-                                    catch
+                                    else
                                     {
                                         hasMorePages = false;
                                     }
                                 }
-                            }
-                            else
-                            {
-                                hasMorePages = false; // Flatbed only scans one page
+                                catch
+                                {
+                                    hasMorePages = false;
+                                }
                             }
                         }
-                        catch (COMException comEx)
+                        else
                         {
-                            // WIA error codes:
-                            // 0x80210003 = WIA_ERROR_PAPER_EMPTY - no more pages
-                            // 0x80210006 = WIA_ERROR_ITEM_DELETED
-                            // 0x80070057 = E_INVALIDARG - parameter incorrect
-                            uint errorCode = (uint)comEx.ErrorCode;
-                            if (errorCode == 0x80210003)
-                            {
-                                Log("WIA: No more pages in feeder.");
-                                hasMorePages = false;
-                            }
-                            else if (errorCode == 0x80210006)
-                            {
-                                Log("WIA: Scanner item no longer available.");
-                                hasMorePages = false;
-                            }
-                            else if (errorCode == 0x80070057 && pageCount > 0)
-                            {
-                                // Parameter incorrect after successful scans usually means no more pages
-                                Log("WIA: No more pages (E_INVALIDARG after successful scan).");
-                                hasMorePages = false;
-                            }
-                            else
-                            {
-                                Log($"WIA: COM error during scan: {comEx.Message} (0x{errorCode:X8})");
-                                if (pageCount == 0)
-                                {
-                                    throw; // Re-throw if no pages were scanned
-                                }
-                                hasMorePages = false;
-                            }
+                            hasMorePages = false; // Flatbed only scans one page
                         }
                     }
                 }
