@@ -16,7 +16,7 @@ namespace ScannerInterface3
     {
         private string logFile = "";
 
-        // WIA Constants
+        // WIA Constants - Property IDs
         private const string WIA_DEVICE_PROPERTY_DOCUMENT_HANDLING_SELECT = "3088";
         private const string WIA_DEVICE_PROPERTY_DOCUMENT_HANDLING_STATUS = "3087";
         private const string WIA_DEVICE_PROPERTY_PAGES = "3096";
@@ -25,6 +25,13 @@ namespace ScannerInterface3
         private const string WIA_ITEM_PROPERTY_VERTICAL_RESOLUTION = "6148";
         private const string WIA_ITEM_PROPERTY_HORIZONTAL_EXTENT = "6151";
         private const string WIA_ITEM_PROPERTY_VERTICAL_EXTENT = "6152";
+        private const string WIA_ITEM_PROPERTY_FORMAT = "4106";
+
+        // WIA Format GUIDs
+        private const string WIA_FORMAT_BMP = "{B96B3CAB-0728-11D3-9D7B-0000F81EF32E}";
+        private const string WIA_FORMAT_PNG = "{B96B3CAF-0728-11D3-9D7B-0000F81EF32E}";
+        private const string WIA_FORMAT_JPEG = "{B96B3CAE-0728-11D3-9D7B-0000F81EF32E}";
+        private const string WIA_FORMAT_TIFF = "{B96B3CB1-0728-11D3-9D7B-0000F81EF32E}";
 
         // Document handling flags
         private const int FEEDER = 1;
@@ -109,23 +116,55 @@ namespace ScannerInterface3
                         ConfigureDocumentHandling(device, useFeeder, useDuplex);
                     }
 
-                    // Get scan item (first item is usually the scanner)
+                    // Get scan item - log available items for diagnostics
                     dynamic items = device.Items;
+                    Log($"WIA: Device has {items.Count} item(s).");
+                    
                     if (items.Count == 0)
                     {
                         return "WIA: No scanner items available.";
                     }
 
-                    dynamic scanItem = items[1]; // WIA uses 1-based indexing
+                    // Try to find the appropriate item (some scanners have separate flatbed/feeder items)
+                    dynamic scanItem = items[1]; // Default to first item (WIA uses 1-based indexing)
+                    
+                    // Log item info for debugging
+                    try
+                    {
+                        for (int i = 1; i <= items.Count; i++)
+                        {
+                            dynamic item = items[i];
+                            string itemName = "Unknown";
+                            try { itemName = item.Properties["Item Name"].Value.ToString(); } catch { }
+                            Log($"WIA: Item {i}: {itemName}");
+                        }
+                    }
+                    catch { }
 
-                    // Set scan properties (resolution first, then color, then extent)
+                    // Set scan properties - each wrapped individually as some scanners don't support all
                     int dpi = GetDpi(resolution);
                     int wiaColorMode = GetWiaColorMode(colorMode);
 
-                    // Set resolution before extent (some scanners require this order)
-                    SetItemProperty(scanItem, WIA_ITEM_PROPERTY_HORIZONTAL_RESOLUTION, dpi);
-                    SetItemProperty(scanItem, WIA_ITEM_PROPERTY_VERTICAL_RESOLUTION, dpi);
-                    SetItemProperty(scanItem, WIA_ITEM_PROPERTY_COLOR_MODE, wiaColorMode);
+                    try
+                    {
+                        SetItemProperty(scanItem, WIA_ITEM_PROPERTY_HORIZONTAL_RESOLUTION, dpi);
+                        Log($"WIA: Set horizontal resolution to {dpi}");
+                    }
+                    catch (Exception ex) { Log($"WIA: Could not set horizontal resolution: {ex.Message}"); }
+
+                    try
+                    {
+                        SetItemProperty(scanItem, WIA_ITEM_PROPERTY_VERTICAL_RESOLUTION, dpi);
+                        Log($"WIA: Set vertical resolution to {dpi}");
+                    }
+                    catch (Exception ex) { Log($"WIA: Could not set vertical resolution: {ex.Message}"); }
+
+                    try
+                    {
+                        SetItemProperty(scanItem, WIA_ITEM_PROPERTY_COLOR_MODE, wiaColorMode);
+                        Log($"WIA: Set color mode to {wiaColorMode}");
+                    }
+                    catch (Exception ex) { Log($"WIA: Could not set color mode: {ex.Message}"); }
 
                     // Try to set extent (optional - some scanners don't support custom extents)
                     try
@@ -149,11 +188,15 @@ namespace ScannerInterface3
                     int pageCount = 0;
                     const int maxPages = 100; // Safety limit
 
-                    // WIA Format GUIDs
-                    const string wiaFormatBMP = "{B96B3CAE-0728-11D3-9D7B-0000F81EF32E}";
-                    const string wiaFormatPNG = "{B96B3CAF-0728-11D3-9D7B-0000F81EF32E}";
-                    const string wiaFormatJPEG = "{B96B3CAB-0728-11D3-9D7B-0000F81EF32E}";
-                    const string wiaFormatTIFF = "{B96B3CB1-0728-11D3-9D7B-0000F81EF32E}";
+                    // Try to set output format to BMP (most compatible)
+                    try
+                    {
+                        SetItemProperty(scanItem, WIA_ITEM_PROPERTY_FORMAT, WIA_FORMAT_BMP);
+                    }
+                    catch
+                    {
+                        Log("WIA: Could not set format property, using device default.");
+                    }
 
                     while (hasMorePages && pageCount < maxPages)
                     {
@@ -161,17 +204,17 @@ namespace ScannerInterface3
                         {
                             Log($"WIA: Scanning page {pageCount + 1}...");
 
-                            // Transfer image - try BMP format first (most compatible)
+                            // Transfer image using parameterless Transfer() - WIA 2.0 style
                             dynamic imageFile = null;
+                            
                             try
                             {
-                                imageFile = scanItem.Transfer(wiaFormatBMP);
+                                imageFile = (dynamic)scanItem.Transfer();
                             }
-                            catch
+                            catch (COMException transferEx)
                             {
-                                // If BMP fails, try without specifying format (use device default)
-                                Log("WIA: BMP format failed, trying default format...");
-                                imageFile = scanItem.Transfer();
+                                Log($"WIA: Transfer() failed with error 0x{(uint)transferEx.ErrorCode:X8}: {transferEx.Message}");
+                                throw;
                             }
 
                             if (imageFile != null)
@@ -199,6 +242,32 @@ namespace ScannerInterface3
                             if (useFeeder)
                             {
                                 hasMorePages = HasMorePagesInFeeder(device);
+                                if (hasMorePages)
+                                {
+                                    // For ADF, we need to get a fresh scan item for each page
+                                    try
+                                    {
+                                        items = device.Items;
+                                        if (items.Count > 0)
+                                        {
+                                            scanItem = items[1];
+                                            // Re-apply format setting for next page
+                                            try
+                                            {
+                                                SetItemProperty(scanItem, WIA_ITEM_PROPERTY_FORMAT, WIA_FORMAT_BMP);
+                                            }
+                                            catch { }
+                                        }
+                                        else
+                                        {
+                                            hasMorePages = false;
+                                        }
+                                    }
+                                    catch
+                                    {
+                                        hasMorePages = false;
+                                    }
+                                }
                             }
                             else
                             {
