@@ -23,8 +23,11 @@ namespace ScannerInterface3
         private const string WIA_ITEM_PROPERTY_COLOR_MODE = "6146";
         private const string WIA_ITEM_PROPERTY_HORIZONTAL_RESOLUTION = "6147";
         private const string WIA_ITEM_PROPERTY_VERTICAL_RESOLUTION = "6148";
+        private const string WIA_ITEM_PROPERTY_HORIZONTAL_START = "6149";
+        private const string WIA_ITEM_PROPERTY_VERTICAL_START = "6150";
         private const string WIA_ITEM_PROPERTY_HORIZONTAL_EXTENT = "6151";
         private const string WIA_ITEM_PROPERTY_VERTICAL_EXTENT = "6152";
+        private const string WIA_ITEM_PROPERTY_BITS_PER_PIXEL = "6153";
         private const string WIA_ITEM_PROPERTY_FORMAT = "4106";
 
         // WIA Format GUIDs
@@ -108,10 +111,13 @@ namespace ScannerInterface3
 
                 try
                 {
-                    // Configure device for feeder/duplex if requested
-                    if (useFeeder || useDuplex)
+                    // Always try to configure document handling for document feeders
+                    // The fi-7160 and similar ADF scanners REQUIRE feeder to be enabled
+                    Log("WIA: Configuring document handling...");
+                    bool isFeederScanner = ConfigureDocumentHandling(device, useFeeder, useDuplex);
+                    if (isFeederScanner)
                     {
-                        ConfigureDocumentHandling(device, useFeeder, useDuplex);
+                        Log("WIA: Document feeder configured.");
                     }
 
                     // Get scan item - log available items for diagnostics
@@ -126,7 +132,7 @@ namespace ScannerInterface3
                     // Try to find the appropriate item (some scanners have separate flatbed/feeder items)
                     dynamic scanItem = items[1]; // Default to first item (WIA uses 1-based indexing)
                     
-                    // Log item info for debugging
+                    // Log item info and all available properties for debugging
                     try
                     {
                         for (int i = 1; i <= items.Count; i++)
@@ -136,8 +142,31 @@ namespace ScannerInterface3
                             try { itemName = item.Properties["Item Name"].Value.ToString(); } catch { }
                             Log($"WIA: Item {i}: {itemName}");
                         }
+                        
+                        // Log some key properties of the scan item
+                        Log("WIA: Scanning item properties:");
+                        foreach (dynamic prop in scanItem.Properties)
+                        {
+                            try
+                            {
+                                string propName = prop.Name.ToString();
+                                string propId = prop.PropertyID.ToString();
+                                // Log key properties: color mode, resolutions, start positions, extents, bits, format
+                                if (propId == "6146" || propId == "6147" || propId == "6148" || 
+                                    propId == "6149" || propId == "6150" || // start positions
+                                    propId == "6151" || propId == "6152" || // extents
+                                    propId == "6153" || propId == "4106")   // bits per pixel, format
+                                {
+                                    Log($"WIA:   {propName} (ID:{propId}) = {prop.Value}");
+                                }
+                            }
+                            catch { }
+                        }
                     }
-                    catch { }
+                    catch (Exception logEx)
+                    {
+                        Log($"WIA: Error logging properties: {logEx.Message}");
+                    }
 
                     // First, try scanning with device defaults (no property changes)
                     // Some scanners fail if properties are set incorrectly
@@ -167,6 +196,15 @@ namespace ScannerInterface3
                         int dpi = GetDpi(resolution);
                         int wiaColorMode = GetWiaColorMode(colorMode);
 
+                        // Set start position to 0,0 (required by some scanners)
+                        try
+                        {
+                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_HORIZONTAL_START, 0);
+                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_VERTICAL_START, 0);
+                            Log("WIA: Set start position to 0,0");
+                        }
+                        catch (Exception ex) { Log($"WIA: Could not set start position: {ex.Message}"); }
+
                         try
                         {
                             SetItemProperty(scanItem, WIA_ITEM_PROPERTY_HORIZONTAL_RESOLUTION, dpi);
@@ -188,21 +226,29 @@ namespace ScannerInterface3
                         }
                         catch (Exception ex) { Log($"WIA: Could not set color mode: {ex.Message}"); }
 
-                        // Try to set extent (optional - some scanners don't support custom extents)
+                        // Set bits per pixel based on color mode
                         try
                         {
-                            if (pageWidth > 0 && pageHeight > 0)
-                            {
-                                // Calculate extent based on resolution and page size (page size in 1/1000 inch)
-                                int horizontalExtent = (int)((pageWidth / 1000.0) * dpi);
-                                int verticalExtent = (int)((pageHeight / 1000.0) * dpi);
-                                SetItemProperty(scanItem, WIA_ITEM_PROPERTY_HORIZONTAL_EXTENT, horizontalExtent);
-                                SetItemProperty(scanItem, WIA_ITEM_PROPERTY_VERTICAL_EXTENT, verticalExtent);
-                            }
+                            int bitsPerPixel = wiaColorMode == COLOR_MODE_BW ? 1 : (wiaColorMode == COLOR_MODE_GRAY ? 8 : 24);
+                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_BITS_PER_PIXEL, bitsPerPixel);
+                            Log($"WIA: Set bits per pixel to {bitsPerPixel}");
+                        }
+                        catch (Exception ex) { Log($"WIA: Could not set bits per pixel: {ex.Message}"); }
+
+                        // Set extent (page size) - REQUIRED for many scanners
+                        try
+                        {
+                            // Use Letter size as default if not specified (8.5" x 11" @ dpi)
+                            int horizontalExtent = pageWidth > 0 ? (int)((pageWidth / 1000.0) * dpi) : (int)(8.5 * dpi);
+                            int verticalExtent = pageHeight > 0 ? (int)((pageHeight / 1000.0) * dpi) : (int)(11.0 * dpi);
+                            
+                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_HORIZONTAL_EXTENT, horizontalExtent);
+                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_VERTICAL_EXTENT, verticalExtent);
+                            Log($"WIA: Set extent to {horizontalExtent}x{verticalExtent} pixels");
                         }
                         catch (Exception ex)
                         {
-                            Log($"WIA: Could not set scan extent (using default): {ex.Message}");
+                            Log($"WIA: Could not set scan extent: {ex.Message}");
                         }
 
                         // Try to set output format to BMP (most compatible)
@@ -348,35 +394,54 @@ namespace ScannerInterface3
             }
         }
 
-        private void ConfigureDocumentHandling(dynamic device, bool useFeeder, bool useDuplex)
+        private bool ConfigureDocumentHandling(dynamic device, bool useFeeder, bool useDuplex)
         {
+            bool configured = false;
             try
             {
-                int handlingFlag = 0;
-
-                if (useFeeder)
+                // First, check what the device supports
+                int capabilities = 0;
+                try
                 {
-                    handlingFlag |= FEEDER;
+                    foreach (dynamic prop in device.Properties)
+                    {
+                        if (prop.PropertyID.ToString() == WIA_DEVICE_PROPERTY_DOCUMENT_HANDLING_STATUS)
+                        {
+                            capabilities = (int)prop.Value;
+                            Log($"WIA: Device capabilities: {capabilities} (FEEDER={((capabilities & FEEDER) != 0)}, FLATBED={((capabilities & FLATBED) != 0)})");
+                            break;
+                        }
+                    }
                 }
-                else
-                {
-                    handlingFlag |= FLATBED;
-                }
+                catch { }
 
+                // For ADF-only scanners (like fi-7160), we MUST enable the feeder
+                // Try feeder first, then flatbed if feeder fails
+                int handlingFlag = FEEDER; // Default to feeder for document scanners
+                
+                if (!useFeeder && (capabilities & FLATBED) != 0)
+                {
+                    handlingFlag = FLATBED;
+                }
+                
                 if (useDuplex)
                 {
                     handlingFlag |= DUPLEX;
                 }
 
+                Log($"WIA: Setting document handling to: {handlingFlag}");
                 SetDeviceProperty(device, WIA_DEVICE_PROPERTY_DOCUMENT_HANDLING_SELECT, handlingFlag);
 
-                // Set pages to 0 = scan all pages
-                SetDeviceProperty(device, WIA_DEVICE_PROPERTY_PAGES, 0);
+                // Set pages to 1 for single page, 0 for all pages
+                SetDeviceProperty(device, WIA_DEVICE_PROPERTY_PAGES, useFeeder ? 0 : 1);
+                
+                configured = true;
             }
             catch (Exception ex)
             {
                 Log($"WIA: Warning - Could not set document handling: {ex.Message}");
             }
+            return configured;
         }
 
         private bool HasMorePagesInFeeder(dynamic device)
