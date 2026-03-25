@@ -1,0 +1,506 @@
+using PdfSharp.Drawing;
+using PdfSharp.Pdf;
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Runtime.InteropServices;
+
+namespace ScannerInterface3
+{
+    /// <summary>
+    /// WIA (Windows Image Acquisition) scanner implementation.
+    /// Used as a fallback when TWAIN scanning fails.
+    /// </summary>
+    public class WiaScanner
+    {
+        private string logFile = "";
+
+        // WIA Constants
+        private const string WIA_DEVICE_PROPERTY_DOCUMENT_HANDLING_SELECT = "3088";
+        private const string WIA_DEVICE_PROPERTY_DOCUMENT_HANDLING_STATUS = "3087";
+        private const string WIA_DEVICE_PROPERTY_PAGES = "3096";
+        private const string WIA_ITEM_PROPERTY_COLOR_MODE = "6146";
+        private const string WIA_ITEM_PROPERTY_HORIZONTAL_RESOLUTION = "6147";
+        private const string WIA_ITEM_PROPERTY_VERTICAL_RESOLUTION = "6148";
+        private const string WIA_ITEM_PROPERTY_HORIZONTAL_EXTENT = "6151";
+        private const string WIA_ITEM_PROPERTY_VERTICAL_EXTENT = "6152";
+
+        // Document handling flags
+        private const int FEEDER = 1;
+        private const int FLATBED = 2;
+        private const int DUPLEX = 4;
+        private const int FRONT_FIRST = 8;
+        private const int BACK_FIRST = 16;
+        private const int FRONT_ONLY = 32;
+        private const int BACK_ONLY = 64;
+        private const int NEXT_PAGE = 128;
+        private const int PREFEED = 256;
+        private const int AUTO_ADVANCE = 512;
+
+        // Color modes
+        private const int COLOR_MODE_BW = 0;       // Black and White (1-bit)
+        private const int COLOR_MODE_GRAY = 2;     // Grayscale
+        private const int COLOR_MODE_COLOR = 1;   // Color
+
+        /// <summary>
+        /// Scan documents to PDF using WIA.
+        /// </summary>
+        public string ScanToPdf(int deviceIndex, string outputPdfPath,
+            bool useFeeder, bool useDuplex,
+            string colorMode, string resolution,
+            int pageWidth, int pageHeight)
+        {
+            logFile = Path.ChangeExtension(outputPdfPath, ".log");
+            Log("WIA fallback: Starting WIA scan...");
+
+            try
+            {
+                // Create WIA DeviceManager
+                var deviceManager = CreateDeviceManager();
+                if (deviceManager == null)
+                {
+                    return "Failed to create WIA DeviceManager.";
+                }
+
+                // Get device info
+                dynamic deviceInfos = deviceManager.DeviceInfos;
+                int scannerCount = 0;
+                dynamic targetDeviceInfo = null;
+                int currentIndex = 0;
+
+                foreach (dynamic deviceInfo in deviceInfos)
+                {
+                    // Type 1 = Scanner
+                    if ((int)deviceInfo.Type == 1)
+                    {
+                        if (currentIndex == deviceIndex)
+                        {
+                            targetDeviceInfo = deviceInfo;
+                            break;
+                        }
+                        currentIndex++;
+                    }
+                    scannerCount++;
+                }
+
+                if (targetDeviceInfo == null)
+                {
+                    return $"WIA: No scanner found at index {deviceIndex}.";
+                }
+
+                string deviceName = targetDeviceInfo.Properties["Name"].Value.ToString();
+                Log($"WIA: Connecting to device: {deviceName}");
+
+                // Connect to the device
+                dynamic device = targetDeviceInfo.Connect();
+                if (device == null)
+                {
+                    return "WIA: Failed to connect to scanner.";
+                }
+
+                var pages = new List<Bitmap>();
+
+                try
+                {
+                    // Configure device for feeder/duplex if requested
+                    if (useFeeder || useDuplex)
+                    {
+                        ConfigureDocumentHandling(device, useFeeder, useDuplex);
+                    }
+
+                    // Get scan item (first item is usually the scanner)
+                    dynamic items = device.Items;
+                    if (items.Count == 0)
+                    {
+                        return "WIA: No scanner items available.";
+                    }
+
+                    dynamic scanItem = items[1]; // WIA uses 1-based indexing
+
+                    // Set scan properties (resolution first, then color, then extent)
+                    int dpi = GetDpi(resolution);
+                    int wiaColorMode = GetWiaColorMode(colorMode);
+
+                    // Set resolution before extent (some scanners require this order)
+                    SetItemProperty(scanItem, WIA_ITEM_PROPERTY_HORIZONTAL_RESOLUTION, dpi);
+                    SetItemProperty(scanItem, WIA_ITEM_PROPERTY_VERTICAL_RESOLUTION, dpi);
+                    SetItemProperty(scanItem, WIA_ITEM_PROPERTY_COLOR_MODE, wiaColorMode);
+
+                    // Try to set extent (optional - some scanners don't support custom extents)
+                    try
+                    {
+                        if (pageWidth > 0 && pageHeight > 0)
+                        {
+                            // Calculate extent based on resolution and page size (page size in 1/1000 inch)
+                            int horizontalExtent = (int)((pageWidth / 1000.0) * dpi);
+                            int verticalExtent = (int)((pageHeight / 1000.0) * dpi);
+                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_HORIZONTAL_EXTENT, horizontalExtent);
+                            SetItemProperty(scanItem, WIA_ITEM_PROPERTY_VERTICAL_EXTENT, verticalExtent);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"WIA: Could not set scan extent (using default): {ex.Message}");
+                    }
+
+                    // Scan pages
+                    bool hasMorePages = true;
+                    int pageCount = 0;
+                    const int maxPages = 100; // Safety limit
+
+                    // WIA Format GUIDs
+                    const string wiaFormatBMP = "{B96B3CAE-0728-11D3-9D7B-0000F81EF32E}";
+                    const string wiaFormatPNG = "{B96B3CAF-0728-11D3-9D7B-0000F81EF32E}";
+                    const string wiaFormatJPEG = "{B96B3CAB-0728-11D3-9D7B-0000F81EF32E}";
+                    const string wiaFormatTIFF = "{B96B3CB1-0728-11D3-9D7B-0000F81EF32E}";
+
+                    while (hasMorePages && pageCount < maxPages)
+                    {
+                        try
+                        {
+                            Log($"WIA: Scanning page {pageCount + 1}...");
+
+                            // Transfer image - try BMP format first (most compatible)
+                            dynamic imageFile = null;
+                            try
+                            {
+                                imageFile = scanItem.Transfer(wiaFormatBMP);
+                            }
+                            catch
+                            {
+                                // If BMP fails, try without specifying format (use device default)
+                                Log("WIA: BMP format failed, trying default format...");
+                                imageFile = scanItem.Transfer();
+                            }
+
+                            if (imageFile != null)
+                            {
+                                // Get the image data from WIA ImageFile
+                                dynamic vector = imageFile.FileData;
+                                byte[] imageData = (byte[])vector.BinaryData;
+                                
+                                Log($"WIA: Received {imageData.Length} bytes of image data.");
+
+                                using (var ms = new MemoryStream(imageData))
+                                {
+                                    var bitmap = new Bitmap(ms);
+                                    pages.Add(new Bitmap(bitmap)); // Clone the bitmap
+                                }
+                                pageCount++;
+                                Log($"WIA: Page {pageCount} scanned successfully.");
+
+                                // Release COM objects
+                                Marshal.ReleaseComObject(vector);
+                                Marshal.ReleaseComObject(imageFile);
+                            }
+
+                            // Check if there are more pages in feeder
+                            if (useFeeder)
+                            {
+                                hasMorePages = HasMorePagesInFeeder(device);
+                            }
+                            else
+                            {
+                                hasMorePages = false; // Flatbed only scans one page
+                            }
+                        }
+                        catch (COMException comEx)
+                        {
+                            // WIA error codes:
+                            // 0x80210003 = WIA_ERROR_PAPER_EMPTY - no more pages
+                            // 0x80210006 = WIA_ERROR_ITEM_DELETED
+                            // 0x80070057 = E_INVALIDARG - parameter incorrect
+                            uint errorCode = (uint)comEx.ErrorCode;
+                            if (errorCode == 0x80210003)
+                            {
+                                Log("WIA: No more pages in feeder.");
+                                hasMorePages = false;
+                            }
+                            else if (errorCode == 0x80210006)
+                            {
+                                Log("WIA: Scanner item no longer available.");
+                                hasMorePages = false;
+                            }
+                            else if (errorCode == 0x80070057 && pageCount > 0)
+                            {
+                                // Parameter incorrect after successful scans usually means no more pages
+                                Log("WIA: No more pages (E_INVALIDARG after successful scan).");
+                                hasMorePages = false;
+                            }
+                            else
+                            {
+                                Log($"WIA: COM error during scan: {comEx.Message} (0x{errorCode:X8})");
+                                if (pageCount == 0)
+                                {
+                                    throw; // Re-throw if no pages were scanned
+                                }
+                                hasMorePages = false;
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    // Release device COM object
+                    if (device != null)
+                    {
+                        Marshal.ReleaseComObject(device);
+                    }
+                }
+
+                if (pages.Count == 0)
+                {
+                    return "WIA: No pages were scanned.";
+                }
+
+                // Create PDF from scanned pages
+                Log($"WIA: Creating PDF with {pages.Count} page(s)...");
+                CreatePdfFromBitmaps(pages, outputPdfPath);
+
+                // Cleanup
+                foreach (var page in pages)
+                {
+                    page.Dispose();
+                }
+                pages.Clear();
+
+                Log("WIA: Scan completed successfully.");
+                return ""; // Empty string indicates success
+            }
+            catch (COMException comEx)
+            {
+                string errorMsg = $"WIA COM error: {comEx.Message} (0x{comEx.ErrorCode:X8})";
+                Log(errorMsg);
+                return errorMsg;
+            }
+            catch (Exception ex)
+            {
+                string errorMsg = $"WIA error: {ex.Message}";
+                Log(errorMsg);
+                return errorMsg;
+            }
+        }
+
+        /// <summary>
+        /// Get list of available WIA scanner devices.
+        /// </summary>
+        public string GetAvailableScanners()
+        {
+            string scannerList = "";
+            try
+            {
+                var deviceManager = CreateDeviceManager();
+                if (deviceManager == null)
+                {
+                    return "";
+                }
+
+                dynamic deviceInfos = deviceManager.DeviceInfos;
+                int index = 0;
+
+                foreach (dynamic deviceInfo in deviceInfos)
+                {
+                    // Type 1 = Scanner
+                    if ((int)deviceInfo.Type == 1)
+                    {
+                        string name = deviceInfo.Properties["Name"].Value.ToString();
+                        scannerList += $"{index}={name} (WIA)\r\n";
+                        index++;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // Swallow exceptions
+            }
+            return scannerList;
+        }
+
+        private dynamic CreateDeviceManager()
+        {
+            try
+            {
+                Type deviceManagerType = Type.GetTypeFromProgID("WIA.DeviceManager");
+                if (deviceManagerType == null)
+                {
+                    Log("WIA: DeviceManager type not found. WIA may not be installed.");
+                    return null;
+                }
+                return Activator.CreateInstance(deviceManagerType);
+            }
+            catch (Exception ex)
+            {
+                Log($"WIA: Failed to create DeviceManager: {ex.Message}");
+                return null;
+            }
+        }
+
+        private void ConfigureDocumentHandling(dynamic device, bool useFeeder, bool useDuplex)
+        {
+            try
+            {
+                int handlingFlag = 0;
+
+                if (useFeeder)
+                {
+                    handlingFlag |= FEEDER;
+                }
+                else
+                {
+                    handlingFlag |= FLATBED;
+                }
+
+                if (useDuplex)
+                {
+                    handlingFlag |= DUPLEX;
+                }
+
+                SetDeviceProperty(device, WIA_DEVICE_PROPERTY_DOCUMENT_HANDLING_SELECT, handlingFlag);
+
+                // Set pages to 0 = scan all pages
+                SetDeviceProperty(device, WIA_DEVICE_PROPERTY_PAGES, 0);
+            }
+            catch (Exception ex)
+            {
+                Log($"WIA: Warning - Could not set document handling: {ex.Message}");
+            }
+        }
+
+        private bool HasMorePagesInFeeder(dynamic device)
+        {
+            try
+            {
+                foreach (dynamic prop in device.Properties)
+                {
+                    if (prop.PropertyID.ToString() == WIA_DEVICE_PROPERTY_DOCUMENT_HANDLING_STATUS)
+                    {
+                        int status = (int)prop.Value;
+                        return (status & FEEDER) != 0;
+                    }
+                }
+            }
+            catch
+            {
+                // Ignore errors checking feeder status
+            }
+            return false;
+        }
+
+        private void SetDeviceProperty(dynamic device, string propertyId, object value)
+        {
+            try
+            {
+                foreach (dynamic prop in device.Properties)
+                {
+                    if (prop.PropertyID.ToString() == propertyId)
+                    {
+                        prop.Value = value;
+                        return;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"WIA: Could not set device property {propertyId}: {ex.Message}");
+            }
+        }
+
+        private void SetItemProperty(dynamic item, string propertyId, object value)
+        {
+            try
+            {
+                foreach (dynamic prop in item.Properties)
+                {
+                    if (prop.PropertyID.ToString() == propertyId)
+                    {
+                        prop.Value = value;
+                        return;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"WIA: Could not set item property {propertyId}: {ex.Message}");
+            }
+        }
+
+        private int GetDpi(string resolution)
+        {
+            switch (resolution?.ToLower())
+            {
+                case "low":
+                    return 100;
+                case "medium":
+                    return 200;
+                case "high":
+                    return 300;
+                default:
+                    return 200;
+            }
+        }
+
+        private int GetWiaColorMode(string colorMode)
+        {
+            switch (colorMode?.ToLower())
+            {
+                case "bw":
+                    return COLOR_MODE_BW;
+                case "gray":
+                    return COLOR_MODE_GRAY;
+                case "color":
+                    return COLOR_MODE_COLOR;
+                default:
+                    return COLOR_MODE_COLOR;
+            }
+        }
+
+        private void CreatePdfFromBitmaps(List<Bitmap> pages, string outputPath)
+        {
+            using (PdfDocument pdf = new PdfDocument())
+            {
+                pdf.Info.Title = "Scanned Document";
+
+                foreach (var page in pages)
+                {
+                    if (page == null || page.Size == Size.Empty)
+                        continue;
+
+                    var pdfPage = pdf.AddPage();
+                    pdfPage.Size = PdfSharp.PageSize.Letter;
+                    pdfPage.Orientation = PdfSharp.PageOrientation.Portrait;
+
+                    using (XGraphics gfx = XGraphics.FromPdfPage(pdfPage))
+                    {
+                        using (var ms = new MemoryStream())
+                        {
+                            page.Save(ms, System.Drawing.Imaging.ImageFormat.Jpeg);
+                            ms.Position = 0;
+
+                            XImage img = XImage.FromStream(ms);
+
+                            double xScale = pdfPage.Width / img.Width;
+                            double yScale = pdfPage.Height / img.Height;
+                            double scale = Math.Min(xScale, yScale);
+
+                            double x = (pdfPage.Width - img.Width * scale) / 2;
+                            double y = (pdfPage.Height - img.Height * scale) / 2;
+
+                            gfx.DrawImage(img, x, y, img.PixelWidth * scale, img.PixelHeight * scale);
+                        }
+                    }
+                }
+
+                pdf.Save(outputPath);
+            }
+        }
+
+        private void Log(string message)
+        {
+            if (!string.IsNullOrEmpty(logFile))
+            {
+                Helpers.Log(logFile, message);
+            }
+        }
+    }
+}
